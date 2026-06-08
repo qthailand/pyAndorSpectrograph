@@ -426,6 +426,7 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self._last_frame_timestamp = None
         self._accumulated_frames = 0
         self._accumulated_frame_arrays: list[np.ndarray] = []
+        self.cooling_toggle_button = None
 
         self.data_dir = Path(__file__).resolve().parent / "data"
         self.data_dir.mkdir(exist_ok=True)
@@ -536,6 +537,14 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         sep1.setFrameShape(QtWidgets.QFrame.VLine)
         ctrl_layout.addWidget(sep1)
         ctrl_layout.addSpacing(8)
+
+        ctrl_layout.addWidget(_lbl("COOLING", dim=True))
+        self.cooling_toggle_button = QtWidgets.QPushButton("Cooling OFF")
+        self.cooling_toggle_button.setCheckable(True)
+        self.cooling_toggle_button.setFixedWidth(110)
+        self.cooling_toggle_button.setEnabled(False)
+        self.cooling_toggle_button.clicked.connect(self._toggle_cooling)
+        ctrl_layout.addWidget(self.cooling_toggle_button)
 
         ctrl_layout.addWidget(_lbl("TEMP TARGET", dim=True))
         ctrl_layout.addWidget(self.target_temp_spin)
@@ -686,6 +695,44 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self.status_label.setText(text)
         logger.info(text)
 
+    def _refresh_cooling_button(self):
+        if self.cooling_toggle_button is None:
+            return
+        if not self.connected:
+            self.cooling_toggle_button.setChecked(False)
+            self.cooling_toggle_button.setText("Cooling OFF")
+            return
+        ret, state = self.sdk.IsCoolerOn()
+        if ret == atmcd_errors.Error_Codes.DRV_SUCCESS:
+            self.cooling_toggle_button.setChecked(bool(state))
+            self.cooling_toggle_button.setText(
+                "Cooling ON" if state else "Cooling OFF"
+            )
+
+    def _toggle_cooling(self):
+        if not self.connected or self.cooling_toggle_button is None:
+            return
+        turn_on = self.cooling_toggle_button.isChecked()
+        if turn_on:
+            ret = self.sdk.CoolerON()
+        else:
+            ret = self.sdk.CoolerOFF()
+        if ret == atmcd_errors.Error_Codes.DRV_SUCCESS:
+            self._refresh_cooling_button()
+            self.set_status(
+                "Cooling turned on" if turn_on else "Cooling turned off"
+            )
+        elif ret == atmcd_errors.Error_Codes.DRV_ACQUIRING:
+            self._refresh_cooling_button()
+            self.set_status(f"Cannot toggle cooler while acquiring ({ret})")
+            QtWidgets.QMessageBox.warning(
+                self, "Error",
+                f"Failed to toggle cooler ({ret}). Cannot change cooling state while acquisition is in progress."
+            )
+        else:
+            self._refresh_cooling_button()
+            self.set_status(f"Cooler toggle failed ({ret})")
+
     def _do_accumulate_mode(self):
         if self.live_running:
             return
@@ -779,6 +826,8 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self.export_button.setEnabled(self.connected and not self.live_running)
         self.accumulate_button.setEnabled(not self.live_running)
         self.accumulate_count_spin.setEnabled(not self.live_running)
+        if self.cooling_toggle_button is not None:
+            self.cooling_toggle_button.setEnabled(self.connected)
 
     # ── Camera scan ────────────────────────────────────────────────────────
 
@@ -860,6 +909,7 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
 
         self.connected = True
         self._load_dark_current()
+        self._refresh_cooling_button()
         self._temp_timer.start()
         self._update_button_state()
 
