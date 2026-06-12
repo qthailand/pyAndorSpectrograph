@@ -11,7 +11,7 @@ UI direction: scientific dark theme
 iDus-specific (unchanged from previous version):
   - ReadMode = FULL_VERTICAL_BINNING
   - imageSize = xpixels (1D spectrum)
-  - dtype = int16 (สัญญาณมีค่าลบได้)
+  - dtype = uint16 (positive raw counts; dark subtract may produce negative values)
   - ไม่ clip หลัง dark subtract
 """
 
@@ -31,10 +31,11 @@ from PyQt5.QtWidgets import (
 import qtawesome as qta
 import qdarktheme
 import numpy as np
+from scipy import stats
 import pyqtgraph as pg
 from pyAndorSDK2 import atmcd, atmcd_codes, atmcd_errors
 from sdk_cleanup import _shutdown_sdk
-
+import matplotlib.pyplot as plt
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -202,6 +203,25 @@ QFrame#plot_frame {{
 }}
 """
 
+def sigma_clipped_dark(frames: list[np.ndarray], sigma: float = 2.0) -> np.ndarray:
+    """
+    Average dark frames โดย reject pixel ที่ห่างจาก median เกิน sigma*std
+    frames: list of 2D or 1D arrays (uint16)
+    """
+    stack = np.array(frames, dtype=np.float32)  # shape (N, xpixels)
+    
+    # ใช้ median แทน mean เป็น reference — robust ต่อ outlier
+    median = np.median(stack, axis=0)
+    std    = np.std(stack, axis=0)
+    
+    # mask pixel ที่เป็น outlier
+    mask = np.abs(stack - median) > sigma * std  # shape (N, xpixels)
+    
+    # replace outlier ด้วย median ของ pixel นั้น
+    cleaned = stack.copy()
+    cleaned[mask] = np.broadcast_to(median, stack.shape)[mask]
+    
+    return np.mean(cleaned, axis=0).astype(np.float32)
 
 
 class TrafficLightButton(QPushButton):
@@ -405,7 +425,7 @@ class CameraInfo:
 
 class SpectrometerWindow(QtWidgets.QMainWindow):
 
-    _N_DARK_FRAMES = 50
+    _N_DARK_FRAMES = 5
 
     def __init__(self):
         super().__init__()
@@ -413,7 +433,8 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setMinimumSize(900, 600)
-
+        self.is_show_spectrum_background = False
+        self.is_show_raw_spectrum = False
         self.connected = False
         self.last_spectrum = None
         self.xpixels = 0
@@ -449,8 +470,23 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self._temp_timer.setInterval(5000)
         self._temp_timer.timeout.connect(self._do_get_temperature)
 
+        self._frame_kin_time: float = 0.0
+        self._frame_start_time: float = 0.0
         self._live_timer = QtCore.QTimer(self)
         self._live_timer.timeout.connect(self._update_live_spectrum)
+
+        self._progress_timer = QtCore.QTimer(self)
+        self._progress_timer.setInterval(10)          # 10 ms → smooth ~100 fps update
+        self._progress_timer.timeout.connect(self._update_acquisition_progress)
+
+    def _update_acquisition_progress(self):
+        """อัปเดต progress bar แบบ smooth ด้วย timer แยกต่างหาก"""
+        if not self.live_running or self._frame_kin_time <= 0:
+            return
+        elapsed = time.monotonic() - self._frame_start_time
+        # clamp ที่ 0.97 เพื่อไม่ให้บาร์เต็มก่อน frame จริงมา
+        pct = min(elapsed / self._frame_kin_time, 0.97)
+        self.acquisition_progress.setValue(int(pct * 1000))
 
     def _init_ui(self):
 
@@ -469,6 +505,14 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         act_clear = QtWidgets.QAction("Clear Dark Current", self)
         act_clear.triggered.connect(self._clear_dark_current)
         tools_menu.addAction(act_clear)
+
+        menu_plot = self.menuBar().addMenu("Plot")
+        self.show_raw_spectrum_action = QtWidgets.QAction("Show Raw Spectrum", self, checkable=True)
+        self.show_raw_spectrum_action.toggled.connect(self._toggle_show_raw_spectrum)
+        menu_plot.addAction(self.show_raw_spectrum_action)
+        self.show_background_action = QtWidgets.QAction("Show Background", self, checkable=True)
+        self.show_background_action.toggled.connect(self._toggle_show_background)
+        menu_plot.addAction(self.show_background_action)
 
         # ── 3. Inject menu bar เข้า title bar แล้ว setMenuWidget ──────────
         #    setMenuWidget() บอก QMainWindow ว่าให้ใช้ widget นี้
@@ -598,7 +642,13 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self.plot_widget.getViewBox().setBackgroundColor(C_PLOT_BG)
 
         self.plot_curve = self.plot_widget.plot(
-            [], pen=pg.mkPen(color=C_PLOT_LINE, width=1.2))
+            [], pen=pg.mkPen(color="#f331c9", width=1.2))
+        self.plot_raw_curve = self.plot_widget.plot(
+            [], pen=pg.mkPen(color="#ec756c", width=1.2)
+        )
+        self.plot_background_curve = self.plot_widget.plot(
+            [], pen=pg.mkPen(color="#b1e1f0", width=1.2)
+        )
 
         plot_frame = QtWidgets.QFrame()
         plot_frame.setObjectName("plot_frame")
@@ -612,12 +662,36 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self.temperature_value_label.setFixedWidth(90)
         self.temperature_value_label.setAlignment(
             QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.temperature_target_label = QtWidgets.QLabel("N/A")
+        self.temperature_target_label.setObjectName("readout")
+        self.temperature_target_label.setFixedWidth(90)
+        self.temperature_target_label.setAlignment(
+            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
         self.fps_value_label = QtWidgets.QLabel("N/A")
         self.fps_value_label.setObjectName("readout")
         self.fps_value_label.setFixedWidth(60)
         self.fps_value_label.setAlignment(
             QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+
+        self.acquisition_progress = QtWidgets.QProgressBar()
+        self.acquisition_progress.setRange(0, 1000)   # resolution 0.1%
+        self.acquisition_progress.setValue(0)
+        self.acquisition_progress.setFixedWidth(140)
+        self.acquisition_progress.setFixedHeight(14)
+        self.acquisition_progress.setTextVisible(False)
+        self.acquisition_progress.setVisible(False)   # ซ่อนไว้ก่อน
+        self.acquisition_progress.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {C_PANEL};
+                border: 1px solid {C_BORDER};
+                border-radius: 3px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {C_ACCENT};
+                border-radius: 2px;
+            }}
+        """)
 
         self.accumulated_frames_value_label = QtWidgets.QLabel("0")
         self.accumulated_frames_value_label.setObjectName("readout")
@@ -647,8 +721,14 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         sb_layout.addWidget(_lbl("TEMP", dim=True))
         sb_layout.addWidget(self.temperature_value_label)
         sb_layout.addSpacing(16)
+        sb_layout.addWidget(_lbl("TARGET", dim=True))
+        sb_layout.addWidget(self.temperature_target_label)
+        sb_layout.addSpacing(16)
         sb_layout.addWidget(_lbl("FPS", dim=True))
         sb_layout.addWidget(self.fps_value_label)
+        sb_layout.addSpacing(8)
+        sb_layout.addWidget(_lbl("ACQ", dim=True))   # label
+        sb_layout.addWidget(self.acquisition_progress)
         sb_layout.addSpacing(16)
         sb_layout.addWidget(_lbl("ACC", dim=True))
         sb_layout.addWidget(self.accumulated_frames_value_label)
@@ -679,9 +759,16 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self.export_button.clicked.connect(self._export_spectrum)
         self.disconnect_button.clicked.connect(self._do_disconnect)
         self.exposure_spin.valueChanged.connect(self._on_exposure_changed)
+        self.target_temp_spin.valueChanged.connect(self._on_target_temp_changed)
 
         self._update_button_state()
         self.setCentralWidget(central)
+
+    def _toggle_show_raw_spectrum(self, checked):
+        self.is_show_raw_spectrum = checked
+
+    def _toggle_show_background(self, checked):
+        self.is_show_spectrum_background = checked
 
     # ── Helpers ────────────────────────────────────────────────────────────
     # แทนที่ setStyleSheet("color: ...") ด้วย function นี้
@@ -690,7 +777,7 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         icon = qta.icon('fa5s.circle', color=hex_color)
         pixmap = icon.pixmap(10, 10)
         self.dark_led_label.setPixmap(pixmap)
-        
+
     def set_status(self, text: str):
         self.status_label.setText(text)
         logger.info(text)
@@ -727,7 +814,8 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
             self.set_status(f"Cannot toggle cooler while acquiring ({ret})")
             QtWidgets.QMessageBox.warning(
                 self, "Error",
-                f"Failed to toggle cooler ({ret}). Cannot change cooling state while acquisition is in progress."
+                f"Failed to toggle cooler ({
+                    ret}). Cannot change cooling state while acquisition is in progress."
             )
         else:
             self._refresh_cooling_button()
@@ -928,6 +1016,7 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self.last_spectrum = None
         self.current_camera_label.setText("No detector connected")
         self.temperature_value_label.setText("N/A")
+        self.temperature_target_label.setText("N/A")
         self.fps_value_label.setText("N/A")
         self._accumulated_frames = 0
         self._update_accumulated_frames_display()
@@ -979,6 +1068,10 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self._accumulated_frame_arrays = []
         self._update_accumulated_frames_display()
         self._update_live_interval()
+        self._frame_start_time = time.monotonic()
+        self.acquisition_progress.setValue(0)
+        self.acquisition_progress.setVisible(True)
+        self._progress_timer.start()
         self._live_timer.start()
         self._update_button_state()
         self.set_status("Live")
@@ -987,6 +1080,9 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         if not self.live_running:
             return
         self._live_timer.stop()
+        self._progress_timer.stop() 
+        self.acquisition_progress.setValue(0)
+        self.acquisition_progress.setVisible(False)
         self.sdk.AbortAcquisition()
         self.live_button.setText("Live")
         self.live_button.setObjectName("live_btn")
@@ -1045,15 +1141,18 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
                 f"Failed to export spectrum:\n{exc}"
             )
 
+
+
     def _update_live_spectrum(self):
         if not self.connected or not self.live_running:
             return
         ret, arr = self.sdk.GetMostRecentImage16(self.xpixels)
         if ret == atmcd_errors.Error_Codes.DRV_SUCCESS:
-            spectrum = np.array(arr, dtype=np.int16).astype(np.float32)
+            raw_spec = np.array(arr, dtype=np.uint16)
             if self.dark_current is not None:
-                spectrum = spectrum - self.dark_current
-
+                spectrum = raw_spec.copy() - self.dark_current
+            else:
+                spectrum = raw_spec.copy()
             if self.live_accumulate_checkbox.isChecked():
                 self._accumulated_frames += 1
                 self._accumulated_frame_arrays.append(spectrum.copy())
@@ -1061,12 +1160,21 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
                 self._accumulated_frames = 1
                 self._accumulated_frame_arrays = [spectrum.copy()]
             self._update_accumulated_frames_display()
-            self._display_spectrum(spectrum)
+            self._display_spectrum(spectrum, raw_spec)
             now = time.monotonic()
             if self._last_frame_timestamp is not None:
                 dt = now - self._last_frame_timestamp
                 if dt > 0:
                     self.fps_value_label.setText(f"{1.0/dt:.2f}")
+                # SDK เริ่ม expose frame ใหม่ทันทีหลัง readout เสร็จ
+                # ประมาณว่า frame ใหม่เริ่มต้นที่ now - (poll_lag)
+                # poll_lag ≈ now - last_timestamp - kin_time
+                actual_cycle = now - self._last_frame_timestamp
+                overshoot = max(0.0, actual_cycle - self._frame_kin_time)
+                self._frame_start_time = now - overshoot   # ← ชดเชย lag
+            else:
+                self._frame_start_time = now
+            self.acquisition_progress.setValue(0)
             self._last_frame_timestamp = now
             return
         if ret == atmcd_errors.Error_Codes.DRV_NO_NEW_DATA:
@@ -1081,19 +1189,29 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         if ret == atmcd_errors.Error_Codes.DRV_SUCCESS:
             # poll slightly faster than acquisition
             interval = int(kin * 1000 * 0.8)
+            self._frame_kin_time = kin   # ← เพิ่มบรรทัดนี้
         self._live_timer.setInterval(max(5, interval))
 
-    def _display_spectrum(self, spectrum: np.ndarray):
+    def _display_spectrum(self, spectrum: np.ndarray, raw_spectrum: np.ndarray):
         self.last_spectrum = spectrum
         self.plot_curve.setData(spectrum)
+        if self.is_show_raw_spectrum:
+            self.plot_raw_curve.setData(raw_spectrum)
+        else:
+            self.plot_raw_curve.setData([])
+
+        if self.is_show_spectrum_background and self.dark_current is not None:
+            self.plot_background_curve.setData(self.dark_current)
+        else:
+            self.plot_background_curve.setData([])
 
     # ── Dark current ───────────────────────────────────────────────────────
 
-    def _dark_current_path(self, exposure: float) -> Path:
-        return self.data_dir / f"{self.camera_serial or 'unknown'}_{exposure:.3f}_{self._N_DARK_FRAMES}.npy"
+    def _dark_current_path(self, exposure: float, temperature: float) -> Path:
+        return self.data_dir / f"{self.camera_serial or 'unknown'}_{exposure:.3f}_{temperature:.1f}_{self._N_DARK_FRAMES}.npy"
 
     def _load_dark_current(self):
-        fp = self._dark_current_path(self.exposure_spin.value())
+        fp = self._dark_current_path(self.exposure_spin.value(), self.target_temp_spin.value())
         if not fp.exists():
             self.dark_current = None
             self.dark_label.setText("DARK")
@@ -1124,7 +1242,7 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
         self.dark_label.setStyle(self.dark_label.style())
         self._set_dark_led_color("#8b0000")
         self.set_status("Dark current cleared")
-        fp = self._dark_current_path(self.exposure_spin.value())
+        fp = self._dark_current_path(self.exposure_spin.value(), self.target_temp_spin.value())
         if fp.exists():
             try:
                 fp.unlink()
@@ -1139,75 +1257,71 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
             return
 
         exposure = self.exposure_spin.value()
-        save_path = self._dark_current_path(exposure)
+        temperature = self.target_temp_spin.value()
+        save_path = self._dark_current_path(exposure, temperature)
         n = self._N_DARK_FRAMES
         was_live = self.live_running
         if was_live:
             self._stop_live()
 
         try:
-            for name, call in [
-                ("SetAcquisitionMode", lambda: self.sdk.SetAcquisitionMode(
-                    atmcd_codes.Acquisition_Mode.ACCUMULATE)),
-                ("SetReadMode", lambda: self.sdk.SetReadMode(
-                    atmcd_codes.Read_Mode.FULL_VERTICAL_BINNING)),
-                ("SetTriggerMode", lambda: self.sdk.SetTriggerMode(
-                    atmcd_codes.Trigger_Mode.INTERNAL)),
-                ("SetExposureTime", lambda: self.sdk.SetExposureTime(exposure)),
-                ("SetNumberAccumulations",
-                 lambda: self.sdk.SetNumberAccumulations(n)),
-                ("SetAccumulationCycleTime",
-                 lambda: self.sdk.SetAccumulationCycleTime(0)),
-            ]:
-                ret = call()
-                logger.info(f"{name} ret={ret}")
+            frames = []
+            for i in range(n):
+                for name, call in [
+                    ("SetAcquisitionMode", lambda: self.sdk.SetAcquisitionMode(
+                        atmcd_codes.Acquisition_Mode.SINGLE_SCAN)),
+                    ("SetReadMode", lambda: self.sdk.SetReadMode(
+                        atmcd_codes.Read_Mode.FULL_VERTICAL_BINNING)),
+                    ("SetTriggerMode", lambda: self.sdk.SetTriggerMode(
+                        atmcd_codes.Trigger_Mode.INTERNAL)),
+                    ("SetExposureTime", lambda: self.sdk.SetExposureTime(exposure))
+                ]:
+                    ret = call()
+                    logger.info(f"{name} ret={ret}")
+                    if ret != atmcd_errors.Error_Codes.DRV_SUCCESS:
+                        self.set_status(f"{name} failed ({ret})")
+                        return
+                ret = self.sdk.PrepareAcquisition()
+                logger.info(f"PrepareAcquisition ret={ret}")
+
+                ret = self.sdk.StartAcquisition()
                 if ret != atmcd_errors.Error_Codes.DRV_SUCCESS:
-                    self.set_status(f"{name} failed ({ret})")
+                    self.set_status(f"StartAcquisition failed ({ret})")
                     return
 
-            ret, exp, acc, kin = self.sdk.GetAcquisitionTimings()
-            logger.info(f"Accumulate Count: {n} exposure={exposure:.3f} s")
-            logger.info(f"Acquisition timings: exp={exp:.3f} s, acc={acc:.3f} s, kin={kin:.3f} s")
+                ret = self.sdk.WaitForAcquisition()
+                logger.info(f"WaitForAcquisition ret={ret}")
 
-            ret = self.sdk.StartAcquisition()
-            if ret != atmcd_errors.Error_Codes.DRV_SUCCESS:
-                self.set_status(f"StartAcquisition failed ({ret})")
-                return
-            t0 = time.perf_counter()
-            while True:
-                ret, status = self.sdk.GetStatus()
-                if ret != atmcd_errors.Error_Codes.DRV_SUCCESS:
-                    self.set_status(f"GetStatus failed ({ret})")
-                    break
-                if status == atmcd_errors.Error_Codes.DRV_IDLE:
-                    break
+                t0 = time.perf_counter()
 
-                time.sleep(exp)
-
-            t1 = time.perf_counter()
-            logger.info(f"Acquisition time: {t1 - t0:.2f} s")
-
-            ret, index = self.sdk.GetTotalNumberImagesAcquired()
-            logger.info(f"TotalNumberImagesAcquired: ret={ret}, index={index}")
-            if ret != atmcd_errors.Error_Codes.DRV_SUCCESS:
-                self.set_status(f"GetTotalNumberImagesAcquired failed ({ret})")
-                return
-
-            if index != 0:
-                ret, arr = self.sdk.GetMostRecentImage16(self.xpixels)
+                ret, data = self.sdk.GetMostRecentImage16(self.xpixels)
                 if ret == atmcd_errors.Error_Codes.DRV_SUCCESS:
-                    frame = arr / n
-                    np.save(save_path, frame)
-            self.sdk.AbortAcquisition()
-            if self.dark_current is not None:
-                logger.info(f"Dark current: {self.dark_current}")
+                    frame = np.array(data, dtype=np.uint16)
+                    # plt.plot(frame, label=f"{i}", alpha=0.3)
+                    frames.append(frame)
+
+                t1 = time.perf_counter()
+                logger.info(f"Acquisition time: {t1 - t0:.2f} s")
+
+                self.sdk.AbortAcquisition()
+                if self.dark_current is not None:
+                    logger.info(f"Dark current: {self.dark_current}")
+            dark = sigma_clipped_dark(frames, sigma=2.0)
+            np.save(save_path, dark)  # บันทึกเป็น float32 ไม่ต้อง cast uint16
+            # plt.show()
         except Exception as exc:
             logger.exception("Dark capture failed")
             QtWidgets.QMessageBox.critical(self, "Capture failed",
-                                          f"An error occurred during dark capture:\n{exc}")
+                                           f"An error occurred during dark capture:\n{exc}")
             return
-        
+
         self._load_dark_current()
+        # plt.plot(self.dark_current, label="Dark Current", alpha=0.3)
+        # plt.title("Captured Dark Current")
+        # plt.xlabel("Pixel")
+        # plt.ylabel("Intensity (counts)")
+        # plt.legend()
+        # plt.show()
         self.set_status(f"Dark saved: {save_path.name}")
         QtWidgets.QMessageBox.information(self, "Dark current saved",
                                           f"Saved {n} frames to:\n{save_path}")
@@ -1219,11 +1333,13 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
     def _do_get_temperature(self):
         if not self.connected:
             return
-        ret, temp, *_ = self.sdk.GetTemperatureStatus()
+        ret, temp, target_temp, *_ = self.sdk.GetTemperatureStatus()
         if ret == atmcd_errors.Error_Codes.DRV_SUCCESS:
             self.temperature_value_label.setText(f"{temp:.1f} °C")
+            self.temperature_target_label.setText(f"{target_temp:.1f} °C")
         else:
             self.temperature_value_label.setText("N/A")
+            self.temperature_target_label.setText("N/A")
 
     # ── Exposure ───────────────────────────────────────────────────────────
 
@@ -1241,6 +1357,17 @@ class SpectrometerWindow(QtWidgets.QMainWindow):
             self.set_status(f"SetExposureTime failed ({ret})")
         if was_live:
             self._start_live()
+
+    def _on_target_temp_changed(self, value: float):
+        if not self.connected:
+            return
+        ret = self.sdk.SetTemperature(value)
+        if ret == atmcd_errors.Error_Codes.DRV_SUCCESS:
+            self._refresh_cooling_button()
+            self._load_dark_current()
+            self.set_status(f"Target temperature set to {value:.1f} °C")
+        else:
+            self.set_status(f"SetTemperature failed ({ret})")
 
     # ── Connect button ─────────────────────────────────────────────────────
 
